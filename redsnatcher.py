@@ -1,5 +1,4 @@
 import json
-import time
 import logging
 import os
 import sqlite3
@@ -11,8 +10,14 @@ import re
 import argparse
 import sys
 import subprocess
+from collections import defaultdict
+import threading
+import queue
 
 from flask import Flask, request, jsonify
+
+# --- Ratelimit imports ---
+from ratelimit import limits, sleep_and_retry
 
 # -----------------------------
 # Release types mapping
@@ -65,6 +70,28 @@ SUPPORTED_MEDIA = {
     8: "Blu-Ray"
 }
 
+# -------------------------------------------------------------------------
+# Some ANSI color codes for extra colorful logs
+# -------------------------------------------------------------------------
+SKIP_ALREADY = "\033[94m"   # Blue
+SKIP_FILTER = "\033[95m"    # Magenta
+RESET_COLOR = "\033[0m"
+
+# -------------------------------------------------------------------------
+# Rate-limit: 10 requests every 10 seconds
+# -------------------------------------------------------------------------
+TEN_CALLS = 10
+TEN_SECONDS = 10
+
+@sleep_and_retry
+@limits(calls=TEN_CALLS, period=TEN_SECONDS)
+def _ratelimited_get(url, params=None, headers=None, stream=False):
+    """
+    A small wrapper for requests.get(...) that respects
+    '10 requests every 10 seconds' using ratelimit.
+    """
+    return requests.get(url, params=params, headers=headers, stream=stream)
+
 def sanitize_filename(filename):
     filename = unidecode(filename)
     filename = re.sub(r'[\\/*?:"<>|]', '', filename)
@@ -78,20 +105,60 @@ class RedSnatcher:
         self.setup_database()
 
         self.tokens_available = self.use_freeleech_tokens_when_available
-        self.already_failed_downloads = set()  # Track torrents that failed "4 times" error
+        self.already_failed_downloads = set()
 
-        # 1) Retrieve user stats (display only).
+        # 1) Retrieve & display user stats
         self.get_and_display_user_stats()
 
-        # 2) Retrieve all previously snatched torrents from Redacted, storing in DB,
-        #    now capturing groupId, name, size, artistId, etc. if present in the response.
-        self.retrieve_and_insert_snatched_torrents_from_api()
+        # 2) Prompt user for skipping the full fetch of snatches
+        if self.should_skip_snatched_fetch():
+            self.logger.info("User pressed Enter. Skipping the full snatches fetch.")
+        else:
+            # If not skipped, do the fetch
+            self.retrieve_and_insert_snatched_torrents_from_api()
 
-        # 3) Automatically synchronize bookmarked artists from Redacted upon startup.
+        # 3) Sync bookmarked artists from Redacted
         self.get_bookmarked_artists()
 
     # -------------------------------------------------------------------------
-    # Load configuration from JSON
+    # Additional method: check if user wants to skip fetching
+    # -------------------------------------------------------------------------
+    def should_skip_snatched_fetch(self, timeout_seconds=5):
+        """
+        Prompt user with a 5-second timeout to press ENTER to skip.
+        If pressed in time, returns True (skip). Else returns False.
+        """
+
+        print(
+            "Press ENTER in the next 5 seconds to skip "
+            "fetching the full list of already snatched torrents..."
+        )
+
+        # We'll read user input in a separate thread with a queue
+        input_queue = queue.Queue()
+
+        def read_input(q):
+            _ = sys.stdin.readline()
+            q.put(True)
+
+        t = threading.Thread(target=read_input, args=(input_queue,))
+        t.daemon = True
+        t.start()
+
+        t.join(timeout=timeout_seconds)
+        # If the thread is still alive, user didn't press ENTER in time
+        if t.is_alive():
+            return False
+        else:
+            # Means user pressed ENTER (we got True in the queue)
+            try:
+                _ = input_queue.get_nowait()  # fetch the item
+                return True
+            except queue.Empty:
+                return False
+
+    # -------------------------------------------------------------------------
+    # Load configuration
     # -------------------------------------------------------------------------
     def load_config(self, config_path):
         if not os.path.exists(config_path):
@@ -115,9 +182,9 @@ class RedSnatcher:
         self.use_freeleech_tokens_when_available = config.get("use_freeleech_tokens_when_available", True)
         self.snatch_freeleech_only = config.get("snatch_freeleech_only", True)
         self.privilege_releases_with_most_tracks = config.get("privilege_releases_with_most_tracks", False)
-        self.max_torrent_size_mb = config.get("maximum_snatched_torrent_size", 1000)  # in MB
+        self.max_torrent_size_mb = config.get("maximum_snatched_torrent_size", 1000)
 
-        # Daemon server settings
+        # Daemon settings
         self.daemon_host = config.get("daemon_host", "0.0.0.0")
         self.daemon_port = config.get("daemon_port", 56789)
 
@@ -125,7 +192,7 @@ class RedSnatcher:
             raise ValueError("Fields 'redacted_api_key', 'redacted_api_url', and 'user_id' must be defined.")
 
     # -------------------------------------------------------------------------
-    # Setup logging
+    # Logging
     # -------------------------------------------------------------------------
     def setup_logging(self):
         formatter = colorlog.ColoredFormatter(
@@ -153,7 +220,7 @@ class RedSnatcher:
         self.logger.info(f"Redacted API URL: {self.redacted_api_url}")
 
     # -------------------------------------------------------------------------
-    # Setup database (create tables if missing)
+    # Database Setup
     # -------------------------------------------------------------------------
     def setup_database(self):
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -201,7 +268,7 @@ class RedSnatcher:
                 'downloaded_format': 'TEXT',
                 'downloaded_media': 'TEXT',
                 'fulfilled_at': 'DATETIME'
-            }
+            },
         }
 
         for table, columns in expected_schema.items():
@@ -211,9 +278,7 @@ class RedSnatcher:
         self.logger.info("Database initialized successfully.")
 
     def check_and_create_table(self, table_name, columns):
-        self.cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
-        )
+        self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
         table_exists = self.cursor.fetchone()
 
         if not table_exists:
@@ -222,7 +287,6 @@ class RedSnatcher:
             self.cursor.execute(create_table_query)
             self.logger.info(f"Table '{table_name}' created successfully.")
         else:
-            # Check if any columns are missing
             self.cursor.execute(f"PRAGMA table_info({table_name})")
             existing_columns = [row[1] for row in self.cursor.fetchall()]
             for col, dtype in columns.items():
@@ -232,64 +296,53 @@ class RedSnatcher:
                     self.logger.info(f"Column '{col}' added to '{table_name}'.")
 
     # -------------------------------------------------------------------------
-    # Rate limit for 2 seconds
-    # -------------------------------------------------------------------------
-    def rate_limit(self):
-        self.logger.debug("Waiting 2 seconds to respect the rate limit.")
-        time.sleep(2)
-
-    # -------------------------------------------------------------------------
-    # Step 1: Retrieve user stats
+    # 1) Retrieve user stats
     # -------------------------------------------------------------------------
     def get_user_stats(self):
         self.logger.info("Retrieving user stats from Redacted.")
         params = {"action": "user", "id": self.user_id}
         headers = {'Authorization': self.redacted_api_key}
         self.logger.debug(f"Request: {params}")
-        self.rate_limit()
-        try:
-            response = requests.get(self.redacted_api_url, params=params, headers=headers)
-            self.logger.debug(f"Response Status: {response.status_code}")
-            if response.status_code != 200:
-                self.logger.error(f"Redacted API Error: {response.text}")
-                return 0
-            data = response.json()
-            if data.get("status") != "success":
-                self.logger.error(f"Redacted API Error: {data.get('error')}")
-                return 0
-            response_data = data.get("response", {})
-            stats = response_data.get("stats", {})
-            community = response_data.get("community", {})
-            snatched_count = community.get("snatched", 0)
-            timestamp = datetime.now()
 
-            self.cursor.execute('''
-                INSERT OR REPLACE INTO user_stats (timestamp, uploaded, downloaded, buffer, ratio, required_ratio, user_class, snatched)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                timestamp,
-                stats.get("uploaded", 0),
-                stats.get("downloaded", 0),
-                stats.get("buffer", 0),
-                stats.get("ratio", 0.0),
-                stats.get("requiredRatio", 0.0),
-                response_data.get("personal", {}).get("class", "Unknown"),
-                snatched_count
-            ))
-            self.conn.commit()
-            self.logger.info(
-                f"User stats updated. "
-                f"Ratio: {stats.get('ratio', 0.0):.2f}, "
-                f"Uploaded: {stats.get('uploaded', 0)}, "
-                f"Downloaded: {stats.get('downloaded', 0)}, "
-                f"Buffer: {stats.get('buffer', 0)}, "
-                f"Required Ratio: {stats.get('requiredRatio', 0.0):.2f}, "
-                f"Snatched: {snatched_count}."
-            )
-            return snatched_count
-        except Exception as e:
-            self.logger.error(f"Error retrieving user stats: {e}")
+        response = _ratelimited_get(self.redacted_api_url, params=params, headers=headers)
+        self.logger.debug(f"Response Status: {response.status_code}")
+        if response.status_code != 200:
+            self.logger.error(f"Redacted API Error: {response.text}")
             return 0
+        data = response.json()
+        if data.get("status") != "success":
+            self.logger.error(f"Redacted API Error: {data.get('error')}")
+            return 0
+
+        response_data = data.get("response", {})
+        stats = response_data.get("stats", {})
+        community = response_data.get("community", {})
+        snatched_count = community.get("snatched", 0)
+        timestamp = datetime.now()
+
+        self.cursor.execute('''
+            INSERT OR REPLACE INTO user_stats (timestamp, uploaded, downloaded, buffer, ratio, required_ratio, user_class, snatched)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            timestamp,
+            stats.get("uploaded", 0),
+            stats.get("downloaded", 0),
+            stats.get("buffer", 0),
+            stats.get("ratio", 0.0),
+            stats.get("requiredRatio", 0.0),
+            response_data.get("personal", {}).get("class", "Unknown"),
+            snatched_count
+        ))
+        self.conn.commit()
+        self.logger.info(
+            f"User stats updated. Ratio: {stats.get('ratio', 0.0):.2f}, "
+            f"Uploaded: {stats.get('uploaded', 0)}, "
+            f"Downloaded: {stats.get('downloaded', 0)}, "
+            f"Buffer: {stats.get('buffer', 0)}, "
+            f"Required Ratio: {stats.get('requiredRatio', 0.0):.2f}, "
+            f"Snatched: {snatched_count}."
+        )
+        return snatched_count
 
     def get_and_display_user_stats(self):
         snatched_count = self.get_user_stats()
@@ -299,25 +352,17 @@ class RedSnatcher:
             self.logger.info(f"Stats retrieval completed. Total snatched reported: {snatched_count}")
 
     # -------------------------------------------------------------------------
-    # Step 2: Retrieve the full list of snatched torrents from user_torrents
-    #         Now we store groupId, name => release_name, artistId, artistName,
-    #         torrentSize => size, etc.
+    # 2) Full snatched torrents from user_torrents
     # -------------------------------------------------------------------------
     def retrieve_and_insert_snatched_torrents_from_api(self):
-        """
-        Fetch all user snatches from Redacted via user_torrents endpoint (type=snatched),
-        storing them in the local DB. This version parses extra fields (groupId, name,
-        artistId, artistName, torrentSize) in addition to torrentId.
-        """
         self.logger.info("Fetching the full list of already snatched torrents from Redacted. Please be patient...")
 
-        # 1) Try to get a total snatched estimate for a progress bar.
+        # Try to get total snatched estimate
         total_snatched_estimate = 0
         try:
             params_stats = {"action": "user", "id": self.user_id}
             headers_stats = {"Authorization": self.redacted_api_key}
-            self.rate_limit()
-            resp = requests.get(self.redacted_api_url, params=params_stats, headers=headers_stats)
+            resp = _ratelimited_get(self.redacted_api_url, params=params_stats, headers=headers_stats)
             if resp.status_code == 200:
                 data_stats = resp.json()
                 if data_stats.get("status") == "success":
@@ -344,80 +389,58 @@ class RedSnatcher:
                 "offset": offset
             }
             headers = {"Authorization": self.redacted_api_key}
-            self.rate_limit()
-            try:
-                response = requests.get(self.redacted_api_url, params=params, headers=headers)
-                if response.status_code != 200:
-                    self.logger.error(f"Error retrieving user snatched torrents: {response.text}")
-                    break
-                data = response.json()
-                if data.get("status") != "success":
-                    self.logger.error(f"Error from user_torrents endpoint: {data.get('error')}")
-                    break
 
-                results = data.get("response", {}).get("snatched", [])
-                if not results:
-                    self.logger.info("No more snatched torrents found in this batch.")
-                    break
+            response = _ratelimited_get(self.redacted_api_url, params=params, headers=headers)
+            if response.status_code != 200:
+                self.logger.error(f"Error retrieving user snatched torrents: {response.text}")
+                break
+            data = response.json()
+            if data.get("status") != "success":
+                self.logger.error(f"Error from user_torrents endpoint: {data.get('error')}")
+                break
 
-                # Insert data
-                for item in results:
-                    # According to the sample JSON structure:
-                    # {
-                    #   "groupId": 2400012,
-                    #   "name": "Rather Vexxxed II : Volume I",
-                    #   "torrentId": 5254750,
-                    #   "torrentSize": "315985029",
-                    #   "artistName": "Mellow Thing",
-                    #   "artistId": 1719563
-                    # }
-                    tid = int(item.get("torrentId"))
-                    gid = int(item.get("groupId", 0))
-                    release_name = item.get("name", "")
-                    size_str = item.get("torrentSize", "0")
-                    try:
-                        size_val = int(size_str)
-                    except:
-                        size_val = 0
-                    artname = item.get("artistName", "")
-                    artid = int(item.get("artistId", 0))
+            results = data.get("response", {}).get("snatched", [])
+            if not results:
+                self.logger.info("No more snatched torrents found in this batch.")
+                break
 
-                    # Insert or update snatched_torrents with these fields
-                    self.cursor.execute('''
-                        INSERT OR IGNORE INTO snatched_torrents (
-                            torrent_id, group_id, release_name, artist_id, artist_name, size
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (tid, gid, release_name, artid, artname, size_val))
+            for item in results:
+                tid = int(item.get("torrentId"))
+                gid = int(item.get("groupId", 0))
+                release_name = item.get("name", "")
+                size_str = item.get("torrentSize", "0")
+                try:
+                    size_val = int(size_str)
+                except:
+                    size_val = 0
+                artname = item.get("artistName", "")
+                artid = int(item.get("artistId", 0))
 
-                    total_fetched += 1
+                self.cursor.execute('''
+                    INSERT OR IGNORE INTO snatched_torrents (
+                        torrent_id, group_id, release_name, artist_id, artist_name, size
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                ''', (tid, gid, release_name, artid, artname, size_val))
 
-                self.conn.commit()
+                total_fetched += 1
 
-                # Show progress if we have an estimate
-                if total_snatched_estimate > 0:
-                    progress_pct = (float(current_page) / float(total_pages_estimate)) * 100.0
-                    self.logger.info(f"Progress: {progress_pct:.1f}% ({total_fetched} snatches recorded)...")
+            self.conn.commit()
 
-                offset += limit
-                current_page += 1
+            if total_snatched_estimate > 0:
+                progress_pct = (float(current_page) / float(total_pages_estimate)) * 100.0
+                self.logger.info(f"Progress: {progress_pct:.1f}% ({total_fetched} snatches recorded)...")
 
-                # If we got fewer than 'limit', likely done.
-                if len(results) < limit:
-                    break
-
-            except Exception as e:
-                self.logger.error(f"Error retrieving user snatched torrents: {e}")
+            offset += limit
+            current_page += 1
+            if len(results) < limit:
                 break
 
         self.logger.info(f"Finished fetching previously snatched torrents. Total found/recorded: {total_fetched}")
 
     # -------------------------------------------------------------------------
-    # Basic DB retrieval
+    # DB retrieval
     # -------------------------------------------------------------------------
     def get_user_torrents_snatched(self):
-        """
-        Reads from DB which torrents have already been snatched.
-        """
         self.logger.info("Retrieving snatched torrents from the DB.")
         try:
             self.cursor.execute('SELECT torrent_id FROM snatched_torrents')
@@ -456,45 +479,36 @@ class RedSnatcher:
     # Bookmarked Artists
     # -------------------------------------------------------------------------
     def get_bookmarked_artists(self):
-        """
-        Retrieve bookmarked artists from Redacted and store them in DB.
-        """
         self.logger.info("Retrieving bookmarked artists from Redacted.")
         params = {"action": "bookmarks", "type": "artists"}
         headers = {'Authorization': self.redacted_api_key}
         self.logger.debug(f"Request: {params}")
-        self.rate_limit()
-        try:
-            response = requests.get(self.redacted_api_url, params=params, headers=headers)
-            self.logger.debug(f"Response Status: {response.status_code}")
-            if response.status_code != 200:
-                self.logger.error(f"Redacted API Error: {response.text}")
-                return []
-            data = response.json()
-            if data.get("status") != "success":
-                self.logger.error(f"Redacted API Error: {data.get('error')}")
-                return []
-            artists = data.get("response", {}).get("artists", [])
-            artist_names = [a.get("artistName") for a in artists]
-            artist_ids = [a.get("artistId") for a in artists]
-            self.logger.info(f"{len(artist_names)} bookmarked artists retrieved.")
-            if artist_names:
-                self.logger.info(f"Artists: {', '.join(artist_names)}")
-            for artist_id, artist_name in zip(artist_ids, artist_names):
-                self.cursor.execute('''
-                    INSERT OR IGNORE INTO bookmarked_artists (artist_id, artist_name)
-                    VALUES (?, ?)
-                ''', (artist_id, artist_name))
-            self.conn.commit()
-            return list(zip(artist_ids, artist_names))
-        except Exception as e:
-            self.logger.error(f"Error retrieving bookmarked artists: {e}")
+
+        response = _ratelimited_get(self.redacted_api_url, params=params, headers=headers)
+        self.logger.debug(f"Response Status: {response.status_code}")
+        if response.status_code != 200:
+            self.logger.error(f"Redacted API Error: {response.text}")
+            return []
+        data = response.json()
+        if data.get("status") != "success":
+            self.logger.error(f"Redacted API Error: {data.get('error')}")
             return []
 
+        artists = data.get("response", {}).get("artists", [])
+        artist_names = [a.get("artistName") for a in artists]
+        artist_ids = [a.get("artistId") for a in artists]
+        self.logger.info(f"{len(artist_names)} bookmarked artists retrieved.")
+        if artist_names:
+            self.logger.info(f"Artists: {', '.join(artist_names)}")
+        for artist_id, artist_name in zip(artist_ids, artist_names):
+            self.cursor.execute('''
+                INSERT OR IGNORE INTO bookmarked_artists (artist_id, artist_name)
+                VALUES (?, ?)
+            ''', (artist_id, artist_name))
+        self.conn.commit()
+        return list(zip(artist_ids, artist_names))
+
     def get_all_bookmarked_artists(self):
-        """
-        Read from DB all bookmarked artists.
-        """
         try:
             self.cursor.execute('SELECT artist_id, artist_name FROM bookmarked_artists')
             return self.cursor.fetchall()
@@ -518,9 +532,8 @@ class RedSnatcher:
             headers = {
                 'Authorization': self.redacted_api_key
             }
-            self.rate_limit()
-            self.logger.debug(f"Browsing page {page} for '{artist_name}'")
-            response = requests.get(self.redacted_api_url, params=params, headers=headers)
+
+            response = _ratelimited_get(self.redacted_api_url, params=params, headers=headers)
             self.logger.debug(f"Browse Response Status: {response.status_code}")
             if response.status_code != 200:
                 self.logger.error(f"Redacted API Error browsing for artist '{artist_name}': {response.text}")
@@ -529,6 +542,7 @@ class RedSnatcher:
             if data.get("status") != "success":
                 self.logger.error(f"Redacted API Error browsing '{artist_name}': {data.get('error')}")
                 break
+
             resp = data.get("response", {})
             current_page = resp.get("currentPage", 1)
             pages = resp.get("pages", 1)
@@ -536,6 +550,7 @@ class RedSnatcher:
             if not browse_results:
                 self.logger.info(f"No torrents found for artist '{artist_name}' on page {page}.")
                 break
+
             results.extend(browse_results)
             if current_page >= pages:
                 break
@@ -549,10 +564,9 @@ class RedSnatcher:
         return size_in_bytes / (1024 * 1024)
 
     # -------------------------------------------------------------------------
-    # Selecting a preferred torrent from a list
+    # Selecting a preferred torrent
     # -------------------------------------------------------------------------
     def select_preferred_torrent(self, torrents_list):
-        # 1) Filter by user-chosen format
         candidates = []
         for fmt in self.selected_formats:
             fmts = [t for t in torrents_list if t.get("format", "") == fmt]
@@ -563,7 +577,6 @@ class RedSnatcher:
         if not candidates:
             return None
 
-        # 2) Filter by media in user-chosen order
         final_candidates = []
         for m in self.media_preference:
             media_matches = [t for t in candidates if t.get("media", "") == m]
@@ -574,38 +587,50 @@ class RedSnatcher:
         if not final_candidates:
             return None
 
-        # 3) Privilege torrent with the most fileCount
         if self.privilege_releases_with_most_tracks:
             final_candidates.sort(key=lambda x: x.get("fileCount", 0), reverse=True)
 
         return final_candidates[0] if final_candidates else None
 
     # -------------------------------------------------------------------------
-    # Should we skip this torrent due to user-defined constraints?
+    # Should we skip?
     # -------------------------------------------------------------------------
     def should_skip_torrent(self, torrent_info):
         tid = torrent_info["torrentId"]
         size_mb = self.bytes_to_mb(torrent_info.get("size", 0))
         if size_mb > self.max_torrent_size_mb:
-            self.logger.info(f"Skipping torrent ID {tid} due to size limit. Size: {size_mb:.2f}MB > {self.max_torrent_size_mb}MB")
+            self.logger.info(
+                f"Skipping torrent ID {tid} due to size limit. "
+                f"Size: {size_mb:.2f}MB > {self.max_torrent_size_mb}MB"
+            )
             return True
+
         if self.snatch_freeleech_only:
             self.logger.debug(
-                f"snatch_freeleech_only is True, checking if torrent ID {tid} is freeleech: {torrent_info.get('isFreeleech', False)}"
+                f"snatch_freeleech_only is True, checking if torrent ID {tid} "
+                f"is freeleech: {torrent_info.get('isFreeleech', False)}"
             )
             if not torrent_info.get("isFreeleech", False):
-                self.logger.info(f"Skipping torrent ID {tid}, not freeleech and snatch_freeleech_only is enabled.")
+                self.logger.info(
+                    f"Skipping torrent ID {tid}, not freeleech and snatch_freeleech_only is enabled."
+                )
                 return True
+
         return False
 
     # -------------------------------------------------------------------------
-    # Actually download a torrent
+    # Actually download torrent
     # -------------------------------------------------------------------------
     def download_torrent(self, torrent_id, artist_name, release_name, release_type_str, year, format_, media):
-        self.logger.info(f"Downloading torrent ID {torrent_id} for '{release_name}' ({release_type_str}) by '{artist_name}'.")
+        self.logger.info(
+            f"Downloading torrent ID {torrent_id} for '{release_name}' ({release_type_str}) by '{artist_name}'."
+        )
         if torrent_id in self.already_failed_downloads:
-            self.logger.info(f"Torrent ID {torrent_id} already failed a 4-times download error previously, skipping.")
+            self.logger.info(
+                f"Torrent ID {torrent_id} already failed a 4-times download error previously, skipping."
+            )
             return None
+
         try:
             save_path = self.artist_torrents_download_path
             if not os.path.exists(save_path):
@@ -621,66 +646,80 @@ class RedSnatcher:
             headers = {
                 'Authorization': self.redacted_api_key
             }
+
             self.logger.debug(f"Download request: {download_params}")
-            self.rate_limit()
-            response = requests.get(self.redacted_api_url, params=download_params, headers=headers, stream=True)
+            response = _ratelimited_get(
+                self.redacted_api_url, params=download_params, headers=headers, stream=True
+            )
             self.logger.debug(f"Download Response: {response.status_code}")
             content_type = response.headers.get('Content-Type')
             self.logger.debug(f"Content-Type: {content_type}")
 
             if response.status_code != 200:
                 self.logger.error(f"Error downloading torrent ID {torrent_id}: {response.text}")
-                # Attempt to parse error
                 try:
                     error_data = response.json()
                     error_msg = error_data.get("error", "").lower()
                     if "freeleech tokens left" in error_msg:
-                        self.logger.warning(f"No freeleech tokens available for torrent ID {torrent_id}. Disabling token usage.")
+                        self.logger.warning(
+                            f"No freeleech tokens available for torrent ID {torrent_id}. Disabling token usage."
+                        )
                         self.tokens_available = False
                         download_params["usetoken"] = 0
                         self.logger.debug(f"Retry download without tokens: {download_params}")
-                        self.rate_limit()
-                        response = requests.get(self.redacted_api_url, params=download_params, headers=headers, stream=True)
+                        response = _ratelimited_get(
+                            self.redacted_api_url, params=download_params, headers=headers, stream=True
+                        )
                         self.logger.debug(f"Retry Response: {response.status_code}")
                         content_type = response.headers.get('Content-Type')
                         self.logger.debug(f"Content-Type after retry: {content_type}")
                         if response.status_code != 200:
-                            self.logger.error(f"Error downloading torrent ID {torrent_id} without tokens: {response.text}")
+                            self.logger.error(
+                                f"Error downloading torrent ID {torrent_id} without tokens: {response.text}"
+                            )
                             try:
                                 error_data = response.json()
-                                if "you have already downloaded this torrent file four times" in error_data.get("error", "").lower():
-                                    self.logger.info(f"Marking torrent ID {torrent_id} as permanently failed (4-times error).")
+                                if "you have already downloaded this torrent file four times" in \
+                                        error_data.get("error", "").lower():
+                                    self.logger.info(
+                                        f"Marking torrent ID {torrent_id} as permanently failed (4-times error)."
+                                    )
                                     self.already_failed_downloads.add(torrent_id)
                             except:
                                 pass
                             return None
                     else:
                         if "you have already downloaded this torrent file four times" in error_msg:
-                            self.logger.info(f"Marking torrent ID {torrent_id} as permanently failed (4-times error).")
+                            self.logger.info(
+                                f"Marking torrent ID {torrent_id} as permanently failed (4-times error)."
+                            )
                             self.already_failed_downloads.add(torrent_id)
                 except:
                     pass
                 return None
 
             if not content_type or 'application/x-bittorrent' not in content_type.lower():
-                self.logger.error(f"The downloaded content is not a torrent file for ID {torrent_id}. Content-Type: {content_type}")
+                self.logger.error(
+                    f"The downloaded content is not a torrent file for ID {torrent_id}. "
+                    f"Content-Type: {content_type}"
+                )
                 error_file = os.path.join(save_path, f"error_{torrent_id}.html")
                 with open(error_file, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
                 self.logger.debug(f"Error content saved to: {error_file}")
-                # Possibly parse for "4 times" again
                 try:
                     error_data = response.json()
                     if "You have already downloaded this torrent file four times" in error_data.get("error", ""):
-                        self.logger.info(f"Marking torrent ID {torrent_id} as permanently failed due to 4-times error.")
+                        self.logger.info(
+                            f"Marking torrent ID {torrent_id} as permanently failed due to 4-times error."
+                        )
                         self.already_failed_downloads.add(torrent_id)
                 except:
                     pass
                 return None
 
-            # Construct a filename
             filename_parts = [
                 artist_name,
                 "-",
@@ -693,14 +732,12 @@ class RedSnatcher:
             filename = sanitize_filename(" ".join(filename_parts) + ".torrent")
             file_path = os.path.join(save_path, filename)
 
-            # Save .torrent file
             with open(file_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
             self.logger.info(f"Torrent downloaded: {file_path}")
 
-            # Insert into downloaded_torrents
             self.cursor.execute('''
                 INSERT OR IGNORE INTO downloaded_torrents (torrent_id, download_path, downloaded_at)
                 VALUES (?, ?, ?)
@@ -742,15 +779,16 @@ class RedSnatcher:
 
                 if group_id in fulfilled_albums:
                     self.logger.info(
-                        f"No new torrents for album '{release_name}' "
-                        f"(GroupID {group_id}, Artist: {artist_name}). Already fulfilled."
+                        f"{SKIP_FILTER}Skipping album '{release_name}' "
+                        f"(GroupID {group_id}, Artist: {artist_name}) already fulfilled.{RESET_COLOR}"
                     )
                     continue
 
                 if release_type_str not in self.selected_release_types:
                     self.logger.info(
-                        f"Skipping album '{release_name}' (GroupID {group_id}, Artist: {artist_name}) "
-                        f"not in selected release types."
+                        f"{SKIP_FILTER}Skipping album '{release_name}' "
+                        f"(GroupID {group_id}, Artist: {artist_name}) "
+                        f"not in selected release types.{RESET_COLOR}"
                     )
                     continue
 
@@ -760,15 +798,12 @@ class RedSnatcher:
                     tid = tinfo.get("torrentId")
                     if (tid in snatched_torrent_ids) and (not self.re_download_snatched):
                         self.logger.info(
-                            f"Skipping torrent ID {tid} for album '{release_name}' (Artist: {artist_name}) "
-                            "because it's already snatched and re_download_snatched=False."
+                            f"{SKIP_ALREADY}Skipping torrent ID {tid} for album '{release_name}' "
+                            f"(Artist: {artist_name}) because it's already snatched "
+                            f"and re_download_snatched=False.{RESET_COLOR}"
                         )
                         continue
                     if self.should_skip_torrent(tinfo):
-                        self.logger.info(
-                            f"Skipping torrent ID {tid} for album '{release_name}' (Artist: {artist_name}) "
-                            f"due to conditions (size/freeleech)."
-                        )
                         continue
                     filtered.append(tinfo)
 
@@ -887,15 +922,16 @@ class RedSnatcher:
 
                 if group_id in fulfilled_albums:
                     self.logger.info(
-                        f"No new torrents for album '{release_name}' "
-                        f"(GroupID {group_id}, Artist: {artist_name}). Already fulfilled."
+                        f"{SKIP_FILTER}Skipping album '{release_name}' "
+                        f"(GroupID {group_id}, Artist: {artist_name}) already fulfilled.{RESET_COLOR}"
                     )
                     continue
 
                 if release_type_str not in self.selected_release_types:
                     self.logger.info(
-                        f"Skipping album '{release_name}' (GroupID {group_id}, Artist: {artist_name}) "
-                        f"not matching selected release types."
+                        f"{SKIP_FILTER}Skipping album '{release_name}' "
+                        f"(GroupID {group_id}, Artist: {artist_name}) "
+                        f"not matching selected release types.{RESET_COLOR}"
                     )
                     continue
 
@@ -905,15 +941,12 @@ class RedSnatcher:
                     tid = tinfo.get("torrentId")
                     if (tid in snatched_torrent_ids) and (not self.re_download_snatched):
                         self.logger.info(
-                            f"Skipping torrent ID {tid} for album '{release_name}' "
-                            f"(Artist: {artist_name}) because it's already snatched and re_download_snatched=False."
+                            f"{SKIP_ALREADY}Skipping torrent ID {tid} for album '{release_name}' "
+                            f"(Artist: {artist_name}) because it's already snatched "
+                            f"and re_download_snatched=False.{RESET_COLOR}"
                         )
                         continue
                     if self.should_skip_torrent(tinfo):
-                        self.logger.info(
-                            f"Skipping torrent ID {tid} for album '{release_name}' "
-                            f"(Artist: {artist_name}) due to conditions (size/freeleech)."
-                        )
                         continue
                     filtered.append(tinfo)
 
@@ -928,7 +961,7 @@ class RedSnatcher:
                 if not chosen:
                     self.logger.info(
                         f"No suitable torrents for album '{release_name}' "
-                        f"after format/media preference."
+                        f"(GroupID {group_id}, Artist: {artist_name}) after format/media preference."
                     )
                     continue
 
@@ -956,7 +989,7 @@ class RedSnatcher:
                     if file_path:
                         try:
                             release_type_id = 0
-                            for k,v in RELEASE_TYPE_MAP.items():
+                            for k, v in RELEASE_TYPE_MAP.items():
                                 if v == chosen_release_type:
                                     release_type_id = k
                                     break
@@ -991,17 +1024,17 @@ class RedSnatcher:
                         self.mark_album_fulfilled(group_id, chosen_format, chosen_media)
                     else:
                         self.logger.info(
-                            f"Failed to download torrent ID {chosen_tid} for '{release_name}'"
+                            f"Failed to download torrent ID {chosen_tid} for '{release_name}'."
                         )
                 else:
                     self.logger.info(
-                        f"Download is disabled. Would have chosen torrent ID {chosen_tid}"
+                        f"Download is disabled. Would have chosen torrent ID {chosen_tid}."
                     )
 
             self.get_and_display_user_stats()
 
     # -------------------------------------------------------------------------
-    # Config menu for torrent download settings
+    # Configuration Menu
     # -------------------------------------------------------------------------
     def configure_settings_interactively(self):
         while True:
@@ -1116,7 +1149,7 @@ class RedSnatcher:
         self.logger.info("Database connection closed.")
 
 # -------------------------------------------------------------------------
-# FLASK + Automatic self-signed certificate
+# FLASK APP + Automatic self-signed certificate
 # -------------------------------------------------------------------------
 app = Flask(__name__)
 snatcher_instance = None
@@ -1165,6 +1198,7 @@ def handle_redsnatcher_api():
         snatcher_instance.logger.info("[Daemon] Received command: process_current_artist")
         if not artist:
             return jsonify({"status": "error", "message": "No artist provided"}), 400
+        # We'll define process_single_artist similarly if needed...
         snatcher_instance.process_single_artist(artist)
         return jsonify({"status": "ok", "command": command, "info": f"Started processing artist: {artist}"})
     else:
@@ -1179,7 +1213,6 @@ def run_daemon_mode(config_path='config.json'):
     certfile = "redsnatcher.crt"
     keyfile = "redsnatcher.key"
 
-    # If either file doesn't exist, generate a new self-signed cert
     if not os.path.exists(certfile) or not os.path.exists(keyfile):
         generate_self_signed_cert(certfile, keyfile)
 
@@ -1199,7 +1232,6 @@ def main():
     else:
         try:
             snatcher = RedSnatcher(config_path=args.config)
-            # Start interactive menu after full initialization.
             snatcher.main_menu()
         except KeyboardInterrupt:
             snatcher.close()
